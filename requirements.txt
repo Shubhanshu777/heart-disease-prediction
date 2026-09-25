@@ -1,0 +1,11 @@
+# Heart Disease Risk Screening – Streamlit app dependencies
+streamlit>=1.32
+pandas>=2.0
+joblib>=1.3
+plotly>=5.18
+
+# NOTE: the .pkl artifacts were produced with a specific scikit-learn version.
+# If unpickling raises a version warning/error, install the version they were
+# trained with. A recent version is pinned loosely here as a starting point.
+scikit-learn>=1.3
+numpy>=1.24
