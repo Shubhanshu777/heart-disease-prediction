@@ -1,16 +1,28 @@
 """Streamlit UI for the SVM-based heart disease risk screening model.
 
-The trained artifacts (model, scaler, and the exact training-time column order)
-are loaded from disk. User inputs are one-hot encoded into the same 18-feature
-layout the model was trained on, scaled with the fitted StandardScaler, and then
-passed to the model for a binary risk prediction.
+Preprocessing mirrors the training notebook, which standardizes features in TWO
+stages:
+
+1. A StandardScaler is fit on the five raw numeric columns
+   (Age, RestingBP, Cholesterol, MaxHR, Oldpeak). This scaler was NOT saved, so
+   it is reconstructed here from ``heart.csv`` using the notebook's cleaning
+   steps (see ``build_numeric_scaler``).
+2. A second StandardScaler (``scaler.pkl``) was fit on the full 18-feature matrix
+   AFTER stage 1 and is what the model consumes.
+
+Skipping stage 1 feeds raw magnitudes (e.g. Age=40) into a scaler that expects
+already-standardized values, which pushes every input far from the decision
+boundary and makes the model predict "high risk" for everyone. Both stages are
+therefore applied here, in order, before ``model.predict``.
 """
 
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 import streamlit as st
+from sklearn.preprocessing import StandardScaler
 
 # Plotly powers the risk gauge. It is optional: if it is not installed the app
 # degrades gracefully to a plain progress bar (see the prediction section).
@@ -68,6 +80,15 @@ st.markdown(
 # Directory that holds the serialized model artifacts (same folder as this file).
 ARTIFACT_DIRECTORY: Path = Path(__file__).resolve().parent
 
+# The five raw numeric columns standardized in stage 1 (see module docstring).
+NUMERIC_FEATURE_COLUMNS: list[str] = [
+    "Age",
+    "RestingBP",
+    "Cholesterol",
+    "MaxHR",
+    "Oldpeak",
+]
+
 
 @st.cache_resource(show_spinner="Loading model…")
 def load_model_artifacts() -> tuple[object, object, list[str]]:
@@ -82,23 +103,54 @@ def load_model_artifacts() -> tuple[object, object, list[str]]:
     return trained_model, fitted_scaler, training_column_order
 
 
-def color_for_probability(probability: float) -> str:
-    """Map a 0–1 risk probability to its reserved status color band."""
-    if probability < 0.40:
+@st.cache_resource(show_spinner="Preparing preprocessing…")
+def build_numeric_scaler() -> StandardScaler:
+    """Reconstruct the stage-1 numeric scaler from ``heart.csv``.
+
+    The training notebook fit a StandardScaler on the five numeric columns but
+    never saved it. We rebuild it here by replaying the notebook's cleaning:
+    drop duplicate rows, then replace physiologically-impossible zeros in
+    Cholesterol and RestingBP with the mean of their non-zero values. Fitting on
+    the same cleaned data reproduces the original scaler's mean/scale exactly.
+    """
+    raw_dataframe = pd.read_csv(ARTIFACT_DIRECTORY / "heart.csv").drop_duplicates()
+
+    cholesterol_nonzero_mean = raw_dataframe.loc[
+        raw_dataframe["Cholesterol"] != 0, "Cholesterol"
+    ].mean()
+    raw_dataframe["Cholesterol"] = (
+        raw_dataframe["Cholesterol"].replace(0, cholesterol_nonzero_mean).round(2)
+    )
+
+    resting_bp_nonzero_mean = raw_dataframe.loc[
+        raw_dataframe["RestingBP"] != 0, "RestingBP"
+    ].mean()
+    raw_dataframe["RestingBP"] = (
+        raw_dataframe["RestingBP"].replace(0, resting_bp_nonzero_mean).round(2)
+    )
+
+    numeric_scaler = StandardScaler()
+    numeric_scaler.fit(raw_dataframe[NUMERIC_FEATURE_COLUMNS])
+    return numeric_scaler
+
+
+def color_for_risk_score(risk_score: float) -> str:
+    """Map a 0–1 risk score to its reserved status color band."""
+    if risk_score < 0.40:
         return STATUS_COLOR_LOW
-    if probability < 0.60:
+    if risk_score < 0.60:
         return STATUS_COLOR_MODERATE
     return STATUS_COLOR_HIGH
 
 
-def build_risk_gauge(probability: float) -> "go.Figure":
-    """Build a Plotly gauge for the estimated probability of heart disease.
+def build_risk_gauge(risk_score: float) -> "go.Figure":
+    """Build a Plotly gauge for the model's heart-disease risk score.
 
     A gauge fits a single headline value with polarity. The moving bar takes the
     status color of its band; the surrounding bands are drawn as recessive tints
     so the value—not the backdrop—is what the eye lands on.
     """
-    percentage: float = probability * 100
+    percentage: float = risk_score * 100
     figure = go.Figure(
         go.Indicator(
             mode="gauge+number",
@@ -112,7 +164,7 @@ def build_risk_gauge(probability: float) -> "go.Figure":
                     "tickfont": {"color": NEUTRAL_INK},
                 },
                 # The bar is the actual reading; it wears the status color.
-                "bar": {"color": color_for_probability(probability), "thickness": 0.7},
+                "bar": {"color": color_for_risk_score(risk_score), "thickness": 0.7},
                 "borderwidth": 0,
                 # Recessive tinted bands give context without competing for attention.
                 "steps": [
@@ -132,6 +184,7 @@ def build_risk_gauge(probability: float) -> "go.Figure":
 
 
 heart_disease_model, feature_scaler, training_column_order = load_model_artifacts()
+numeric_scaler = build_numeric_scaler()
 
 # --- Sidebar: model information ----------------------------------------------
 with st.sidebar:
@@ -146,8 +199,9 @@ with st.sidebar:
         # The exact one-hot layout the scaler and model expect.
         st.write(training_column_order)
     st.caption(
-        "Inputs are one-hot encoded, scaled with the fitted StandardScaler, "
-        "then classified. Predictions are only as good as the training data."
+        "Inputs are one-hot encoded, standardized in two stages (numeric scaler "
+        "then the full-feature scaler), and classified. Predictions are only as "
+        "good as the training data."
     )
 
 # --- Header -------------------------------------------------------------------
@@ -244,10 +298,16 @@ if predict_button_clicked:
         "ST_Slope_Down": 1 if st_slope == "Down" else 0,
     }
 
-    # Align columns to the training order (extra dropped, missing filled with 0),
-    # then scale with the StandardScaler that was fitted on all 18 features.
+    # Align columns to the training order (extra dropped, missing filled with 0).
     input_dataframe: pd.DataFrame = pd.DataFrame([raw_feature_values]).reindex(
         columns=training_column_order, fill_value=0
+    )
+
+    # Stage 1: standardize the five raw numeric columns with the reconstructed
+    # numeric scaler. Stage 2: apply the saved full-feature scaler. Applying both
+    # in this order is what the model was trained on (see module docstring).
+    input_dataframe[NUMERIC_FEATURE_COLUMNS] = numeric_scaler.transform(
+        input_dataframe[NUMERIC_FEATURE_COLUMNS]
     )
     scaled_input: pd.DataFrame = pd.DataFrame(
         feature_scaler.transform(input_dataframe), columns=training_column_order
@@ -255,11 +315,18 @@ if predict_button_clicked:
 
     predicted_class: int = int(heart_disease_model.predict(scaled_input)[0])
 
-    # Prefer a calibrated probability when the model exposes one; otherwise fall
-    # back to the raw decision score (some SVMs are trained without probability).
-    risk_probability: float | None = None
+    # Derive a 0–1 risk score for the gauge. If the model exposes calibrated
+    # probabilities, use them; otherwise squash the SVM's signed decision margin
+    # through a logistic function. The latter is an indicative score, NOT a
+    # calibrated probability (this SVM was trained without probability=True).
+    risk_score: float | None = None
+    score_is_calibrated: bool = False
     if hasattr(heart_disease_model, "predict_proba"):
-        risk_probability = float(heart_disease_model.predict_proba(scaled_input)[0][1])
+        risk_score = float(heart_disease_model.predict_proba(scaled_input)[0][1])
+        score_is_calibrated = True
+    elif hasattr(heart_disease_model, "decision_function"):
+        decision_margin = float(heart_disease_model.decision_function(scaled_input)[0])
+        risk_score = float(1.0 / (1.0 + np.exp(-decision_margin)))
 
     st.divider()
     if predicted_class == 1:
@@ -267,33 +334,41 @@ if predict_button_clicked:
     else:
         st.success("### ✅ LOW risk of heart disease")
 
-    if risk_probability is not None:
+    if risk_score is not None:
         # Prefer the richer gauge; fall back to a progress bar without Plotly.
         if PLOTLY_AVAILABLE:
-            st.plotly_chart(
-                build_risk_gauge(risk_probability), use_container_width=True
-            )
+            st.plotly_chart(build_risk_gauge(risk_score), use_container_width=True)
         else:
-            st.progress(risk_probability)
-        st.metric("Estimated probability of heart disease", f"{risk_probability:.0%}")
+            st.progress(risk_score)
+        score_label: str = (
+            "Estimated probability of heart disease"
+            if score_is_calibrated
+            else "Risk score (indicative, not a calibrated probability)"
+        )
+        st.metric(score_label, f"{risk_score:.0%}")
 
     with st.expander("Review the values you entered"):
+        # Values are cast to strings so the single mixed-type "Value" column
+        # serializes cleanly to Arrow (numbers + text in one column otherwise
+        # triggers a pyarrow conversion warning).
+        entered_values: dict[str, str] = {
+            "Age": str(patient_age),
+            "Sex": patient_sex,
+            "Chest pain type": chest_pain_type,
+            "Resting BP (mm Hg)": str(resting_blood_pressure),
+            "Cholesterol (mg/dL)": str(serum_cholesterol),
+            "Fasting BS > 120": "Yes" if fasting_blood_sugar_over_120 else "No",
+            "Resting ECG": resting_ecg_result,
+            "Max HR (BPM)": str(maximum_heart_rate),
+            "Exercise angina": exercise_induced_angina,
+            "Oldpeak": str(st_depression_oldpeak),
+            "ST slope": st_slope,
+        }
         st.table(
             pd.DataFrame(
-                {
-                    "Age": [patient_age],
-                    "Sex": [patient_sex],
-                    "Chest pain type": [chest_pain_type],
-                    "Resting BP (mm Hg)": [resting_blood_pressure],
-                    "Cholesterol (mg/dL)": [serum_cholesterol],
-                    "Fasting BS > 120": ["Yes" if fasting_blood_sugar_over_120 else "No"],
-                    "Resting ECG": [resting_ecg_result],
-                    "Max HR (BPM)": [maximum_heart_rate],
-                    "Exercise angina": [exercise_induced_angina],
-                    "Oldpeak": [st_depression_oldpeak],
-                    "ST slope": [st_slope],
-                }
-            ).T.rename(columns={0: "Value"})
+                {"Value": list(entered_values.values())},
+                index=list(entered_values.keys()),
+            )
         )
 
 # --- Disclaimer ---------------------------------------------------------------
